@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Linq;
 using UnityEngine;
 
 public class PoissonColliderCreator : ColliderCreator<PoissonColliderData> {
@@ -30,11 +29,12 @@ public class PoissonColliderCreator : ColliderCreator<PoissonColliderData> {
         }
         PoissonUserSettings poissonSettings = settings as PoissonUserSettings;
         PoissonColliderData poissonData = GetColliderData();
-        List<Vector3> pointsWorld = new List<Vector3>(meshData.triangles.Count/3);
+        List<Vector3> pointsWorld = new List<Vector3>(poissonSettings.targetCount);
         poissonData.Points = pointsWorld;
 
         IList<Vector3> v = meshData.vertices;
         IList<int> t = meshData.triangles;
+        
 
 
         if (t == null || t.Count < 3)
@@ -50,17 +50,28 @@ public class PoissonColliderCreator : ColliderCreator<PoissonColliderData> {
             Debug.LogWarning("MeshPoisson: Total mesh surface area is zero.");
             return;
         }
-
+        // Algorithm 
+        // totalArea / targetCount = area per point, apr / pir^2 = radius for poisson test for full coverage, percent coverage
+        // apr / pi = 1/percent * r^2
         
-        float r2 = poissonSettings.radius * poissonSettings.radius;
-
+        float radius = poissonSettings.radius;
+        float r2  = poissonSettings.BasedOnSurfaceArea ?
+            ((totalArea / poissonSettings.targetCount) * poissonSettings.PercentSurfaceCoverage)/ Mathf.PI :   
+            radius * radius;
+        if(poissonSettings.BasedOnSurfaceArea) {
+            float adjustedRadius = Mathf.Sqrt(r2);
+            poissonSettings.radius = adjustedRadius;
+            poissonSettings.colliderRadius = adjustedRadius / poissonSettings.ColliderToSampleRatio;
+            poissonSettings.insetDistance = adjustedRadius * poissonSettings.InsetPercent;
+        }
+        Dictionary<int, List<int>> usedTriangleIndices = new Dictionary<int, List<int>>(poissonSettings.targetCount);
         int attempts = 0;
         while (attempts < poissonSettings.maxAttempts && pointsWorld.Count < poissonSettings.targetCount)
         {
             attempts++;
 
             int triIndex = PickTriangleIndex(cdf, UnityEngine.Random.value);
-
+            
             int i0 = t[triIndex * 3 + 0];
             int i1 = t[triIndex * 3 + 1];
             int i2 = t[triIndex * 3 + 2];
@@ -70,7 +81,7 @@ public class PoissonColliderCreator : ColliderCreator<PoissonColliderData> {
             Vector3 cL = v[i2];
 
             Vector3 pL = SamplePointInTriangle(ref aL, ref bL,  ref cL);
-            Vector3 pW = tr.TransformPoint(pL);
+            // Vector3 pW = tr.TransformPoint(pL);
 
 
             //push inward along triangle normal
@@ -79,27 +90,37 @@ public class PoissonColliderCreator : ColliderCreator<PoissonColliderData> {
                 Vector3 nL = Vector3.Cross(bL - aL, cL - aL);
                 if (nL.sqrMagnitude > 1e-12f)
                 {
-                    nL.Normalize();
-                    Vector3 nW = tr.TransformDirection(nL).normalized;
+                    
+                    // Vector3 nW = tr.TransformDirection(nL).normalized;
 
                     // "Inward" = just go opposite to the triangle normal
-                    pW -= nW * poissonSettings.insetDistance;
+                    pL -= nL * poissonSettings.insetDistance;
                 }
             }
 
-
+            if(usedTriangleIndices.TryGetValue(triIndex, out List<int> existingIndices)) {
+                if(!IsPointCanadidateValid(ref pL, pointsWorld, existingIndices, r2)) {
+                    continue;
+                }
+                
+            } else {
+                usedTriangleIndices[triIndex] = new List<int>();
+            }
+            
             bool ok = true;
             for (int i = 0; i < pointsWorld.Count; i++)
             {
-                if ((pointsWorld[i] - pW).sqrMagnitude < r2)
+                if ((pointsWorld[i] - pL).sqrMagnitude < r2)
                 {
                     ok = false;
                     break;
                 }
             }
 
-            if (ok)
-                pointsWorld.Add(pW);
+            if (ok){
+                usedTriangleIndices[triIndex].Add(pointsWorld.Count);
+                pointsWorld.Add(pL);
+            }
         }
     }
 
@@ -137,6 +158,17 @@ public class PoissonColliderCreator : ColliderCreator<PoissonColliderData> {
         }
 
         return cdf;
+    }
+
+    private static bool IsPointCanadidateValid(ref Vector3 point, IList<Vector3> existingPoints, IList<int> indices, float minDistSquared)
+    {
+        for (int i = 0; i < indices.Count; i++)
+        {
+            Vector3 existingPoint = existingPoints[indices[i]];
+            if ((point - existingPoint).sqrMagnitude < minDistSquared)
+                return false;
+        }
+        return true;
     }
 
     /// <summary>
@@ -187,9 +219,10 @@ public  class PoissonColliderData : ColliderData {
 
     public override void AddDataAsColliders(UserSettings settings, GameObject gameObject) {
         PoissonUserSettings poissonSettings = settings as PoissonUserSettings;
-        Span<Vector3> ptsArray = new Span<Vector3>(Points.ToArray());
-        gameObject.transform.InverseTransformPoints(ptsArray);
-        foreach(var p in ptsArray) {
+        
+        // Span<Vector3> ptsArray = new Span<Vector3>(Points.ToArray());
+        // gameObject.transform.InverseTransformPoints(ptsArray);
+        foreach(var p in Points) {
             SphereCollider sc = gameObject.AddComponent<SphereCollider>();
             sc.center = p;
             sc.radius = poissonSettings.colliderRadius;
@@ -216,9 +249,24 @@ public class PoissonUserSettings : UserSettings {
     public bool isTrigger = false;
     [Tooltip("Physics Material assigned to generated SphereColliders.")]
     public PhysicsMaterial colliderMaterial = null;
+    [Tooltip("Whether to base the number of colliders on the surface area of the mesh. (Overrides radius and target count)")]
+
+    public bool BasedOnSurfaceArea;
+    [Tooltip("Collider to sample ratio when BasedOnSurfaceArea is enabled.")]
+    public float ColliderToSampleRatio = 2;
+    [Tooltip("inset percent of radius for poisson sampling")]
+    public float InsetPercent = 0.2f;
+    [Tooltip("Percent of surface area to aim to cover with colliders when BasedOnSurfaceArea is enabled. \n recommended values: .5 to 3")]
+    public float PercentSurfaceCoverage = 1;
+    // total area of the mesh to estimate, sample radius test, colliders to estimate, int targetsamples per surface meter
+    // float ratio of sample to collider, if you could also estimate the volume, then base colliders on surface to volume
+    // inset persent of collider size, 
+    // small surface area should keep same target, lower radius test
 
     public PoissonUserSettings() {
         colliderType = ColliderType.Poisson;
     }
+
+    
 }
 #endregion
